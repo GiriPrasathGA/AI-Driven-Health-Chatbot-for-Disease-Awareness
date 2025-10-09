@@ -1,0 +1,31 @@
+# --- Core Dependencies ---
+fastapi
+uvicorn
+pydantic
+python-dotenv
+
+# --- LangChain & Integrations ---
+langchain
+langchain-core
+langchain-community
+langchain-cohere
+langchain-groq
+
+# --- Vector Database ---
+faiss-cpu
+
+# --- Embedding & LLM Providers ---
+cohere
+groq
+
+# --- Translation ---
+deep-translator
+
+# --- PDF Processing ---
+PyPDF2
+
+# --- Text Splitting ---
+tiktoken  # used internally by LangChain text splitter
+
+# --- Optional Utilities ---
+numpy
