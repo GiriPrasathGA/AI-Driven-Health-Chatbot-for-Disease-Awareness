@@ -1,6 +1,9 @@
 import os
 from dotenv import load_dotenv
 from typing import List, Tuple
+import requests
+from urllib.parse import quote_plus
+import re
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +28,7 @@ LLM_MODEL = "llama-3.1-8b-instant"
 RETRIEVER_K = 4
 
 # --- FastAPI Setup ---
-app = FastAPI(title="AI Medicine Assistant (Simple)", version="1.0")
+app = FastAPI(title="AI Medicine Assistant (with WHO)", version="1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,12 +48,37 @@ def detect_lang(text: str) -> str:
         return "en"
 
 def translate_text(text: str, target_lang: str = "en") -> str:
+    if not text:
+        return text
     if target_lang.lower() == "en":
         return text
     try:
         return GoogleTranslator(source='auto', target=target_lang).translate(text)
     except Exception:
         return text
+
+
+# --- WHO API Fetcher ---
+def fetch_who_info(disease_name: str):
+    """Fetch related info from WHO API (health topics or ICD-11)."""
+    try:
+        q = quote_plus(disease_name)
+        url = f"https://id.who.int/icd/release/11/2024/mms/search?q={q}"
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            entities = data.get("destinationEntities") or []
+            if entities:
+                ent = entities[0]
+                return {
+                    "title": ent.get("title"),
+                    "definition": ent.get("definition"),
+                    "icd_url": ent.get("browserUrl")
+                }
+    except Exception:
+        pass
+    return None
+
 
 # --- Startup: Load FAISS and Embeddings ---
 @app.on_event("startup")
@@ -64,27 +92,30 @@ async def startup_event():
     )
     print("✅ FAISS index loaded successfully.")
 
+
 # --- Pydantic Models ---
 class ChatRequest(BaseModel):
     session_id: str
     question: str
     chat_history: List[Tuple[str, str]] = []
 
+
 class ChatResponse(BaseModel):
     answer: str
+
 
 # --- RAG Chain Setup ---
 def create_rag_chain(vectorstore):
     llm = ChatGroq(
-        temperature=0.3,
+        temperature=0.5,  # slightly higher for more natural responses
         model_name=LLM_MODEL,
         groq_api_key=os.getenv("GROQ_API_KEY")
     )
 
     MAIN_PROMPT = PromptTemplate(
         template="""
-You are a compassionate AI Medicine Assistant. Speak naturally and empathetically.
-Use ONLY the information in the given context.
+You are a compassionate AI Medicine Assistant.
+Answer clearly, empathetically, and medically accurately using ONLY the context below.
 
 Context:
 {context}
@@ -100,6 +131,7 @@ Answer:""",
         llm=llm, retriever=retriever, combine_docs_chain_kwargs={"prompt": MAIN_PROMPT}
     )
 
+
 # --- Greeting Handler ---
 def handle_greetings(user_input: str, lang: str) -> str:
     greetings = ["hi", "hello", "hey", "வணக்கம்"]
@@ -110,6 +142,7 @@ def handle_greetings(user_input: str, lang: str) -> str:
         )
     return ""
 
+
 # --- Chat Endpoint ---
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_bot(request: ChatRequest):
@@ -117,38 +150,70 @@ async def chat_with_bot(request: ChatRequest):
         raise HTTPException(status_code=500, detail="Knowledge base not loaded")
 
     input_text = request.question.strip()
+    if not input_text:
+        raise HTTPException(status_code=400, detail="Empty question")
+
     user_lang = detect_lang(input_text) or "en"
 
-    # --- Check for greetings ---
+    # --- Greeting check ---
     greeting_reply = handle_greetings(input_text, user_lang)
     if greeting_reply:
         return ChatResponse(answer=greeting_reply)
 
-    # --- Translate user query to English ---
+    # --- Translate question to English ---
     translated_q = translate_text(input_text, "en")
 
-    # --- Create or reuse RAG chain session ---
+    # --- Fetch WHO information ---
+    who_info = fetch_who_info(translated_q)
+    external_data = ""
+    if who_info:
+        external_data = f"""
+WHO ICD-11 Information:
+Title: {who_info.get('title')}
+Definition: {who_info.get('definition')}
+More Info: {who_info.get('icd_url')}
+"""
+
+    # --- Create or reuse RAG session ---
     if request.session_id not in sessions:
         sessions[request.session_id] = {"rag": create_rag_chain(vector_store)}
     rag_chain = sessions[request.session_id]["rag"]
 
     try:
-        # --- Call RAG Chain for detailed response ---
+        # --- RAG Chain Invocation ---
         result = rag_chain.invoke({
-            "question": translated_q,
+            "question": f"{translated_q}\n\n{external_data}",
             "chat_history": request.chat_history
         })
-        answer = result["answer"].strip()
+        answer = result.get("answer", "").strip()
 
-        # Add gentle medical disclaimer
+        # --- Remove repeated lines ---
+        lines = answer.split("\n")
+        unique_lines = []
+        for line in lines:
+            if line.strip() and (len(unique_lines) == 0 or line.strip() != unique_lines[-1].strip()):
+                unique_lines.append(line)
+        answer = "\n".join(unique_lines)
+
+        # --- Clean Tamil repetitive pattern ---
+        if user_lang.lower() in ["ta", "tamil"]:
+            answer = re.sub(r'(நீங்கள்\s+காய்ச்சல்\s+இருக்கும்\s+போது,?\s*){2,}', r'\1', answer)
+
+        # --- Limit output length ---
+        if len(answer) > 2000:
+            answer = answer[:2000] + "..."
+
+        # --- Add Disclaimer ---
         answer += "\n\n⚕️ Please consult a healthcare professional for personalized advice."
 
-        # Translate back to user language
+        # --- Translate Back ---
         final_answer = translate_text(answer, user_lang)
+
         return ChatResponse(answer=final_answer)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
 
 # --- Run Server ---
 if __name__ == "__main__":
