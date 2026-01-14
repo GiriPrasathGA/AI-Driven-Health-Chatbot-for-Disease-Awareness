@@ -1,4 +1,24 @@
-.database/
-.__pycache__/
-.venv/
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Environment variables
 .env
+
+# FAISS indexes (generated)
+FAISS/
+
+# PDFs / raw documents
+database/
+*.pdf
+
+# Runtime cache / memory
+disease_cache.json
+inbuilt_memory.txt
+
+# OS files
+.DS_Store
+Thumbs.db

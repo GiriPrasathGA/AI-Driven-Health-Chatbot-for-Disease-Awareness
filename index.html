@@ -99,6 +99,22 @@
       box-shadow: 0 0 8px rgba(59,130,246,0.3);
     }
 
+    #upload-btn {
+      background: #60a5fa;
+      color: white;
+      border: none;
+      padding: 0.8rem 1.4rem;
+      border-radius: 25px;
+      cursor: pointer;
+      font-size: 1rem;
+      font-weight: 500;
+      transition: background 0.2s ease, transform 0.1s ease;
+    }
+    #upload-btn:hover {
+      background: #3b82f6;
+      transform: scale(1.05);
+    }
+    
     #send-btn {
       background: #3b82f6;
       color: white;
@@ -114,6 +130,9 @@
       background: #2563eb;
       transform: scale(1.05);
     }
+
+    /* Hide the file input */
+    #file-input { display: none; }
 
     /* --- Animations --- */
     @keyframes fadeIn {
@@ -141,6 +160,8 @@
   <div id="chat-container"></div>
 
   <div id="input-container">
+    <input type="file" id="file-input" accept="image/*">
+    <button id="upload-btn">Upload Rx</button>
     <textarea id="input" rows="1" placeholder="Type your message..."></textarea>
     <button id="send-btn">Send</button>
   </div>
@@ -149,9 +170,11 @@
     const chatContainer = document.getElementById('chat-container');
     const input = document.getElementById('input');
     const sendBtn = document.getElementById('send-btn');
+    const uploadBtn = document.getElementById('upload-btn');
+    const fileInput = document.getElementById('file-input');
 
     const messages = [
-      { role: 'ai', content: "Hello! I'm your AI Medicine Assistant. How can I help you?" }
+      { role: 'ai', content: "Hello! I'm your AI Medicine Assistant. How can I help you? You can also upload a prescription." }
     ];
 
     function renderMessages() {
@@ -168,9 +191,12 @@
 
     async function sendMessage() {
       const text = input.value.trim();
-      if(!text) return;
+      const hasFile = fileInput.files.length > 0;
+      if (!text && !hasFile) return;
 
-      messages.push({ role: 'user', content: text });
+      const userMessageContent = hasFile ? (text || 'Uploaded a prescription...') : text;
+
+      messages.push({ role: 'user', content: userMessageContent });
       renderMessages();
       input.value = '';
 
@@ -178,26 +204,52 @@
       renderMessages();
 
       try {
-        const res = await fetch("http://127.0.0.1:8000/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            session_id: "default_session",
-            question: text,
-            chat_history: messages
-              .filter(m => m.role === "user" || m.role === "ai")
-              .map(m => [m.role, m.content])
-          })
-        });
-        const data = await res.json();
-        messages.pop(); // remove typing
-        messages.push({ role: 'ai', content: data.answer });
+        let response;
+        if (hasFile) {
+          const formData = new FormData();
+          formData.append('session_id', 'default_session');
+          formData.append('question', text);
+          formData.append('file', fileInput.files[0]);
+
+          response = await fetch("http://127.0.0.1:8000/upload_prescription", {
+            method: "POST",
+            body: formData
+          });
+          fileInput.value = '';
+        } else {
+          response = await fetch("http://127.0.0.1:8000/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: "default_session",
+              question: text,
+              chat_history: messages
+                .filter(m => m.content && (m.role === "user" || m.role === "ai"))
+                .map(m => [m.role, m.content])
+            })
+          });
+        }
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        messages.pop();
+
+        if (data && typeof data.answer === 'string') {
+          messages.push({ role: 'ai', content: data.answer });
+        } else {
+          messages.push({ role: 'ai', content: "⚠️ The server sent an invalid response." });
+        }
+
         renderMessages();
+
       } catch (err) {
         messages.pop();
-        messages.push({ role: 'ai', content: "⚠️ Error connecting to AI server." });
+        messages.push({ role: 'ai', content: `⚠️ Error: ${err.message || "An unknown error occurred."}` });
         renderMessages();
-        console.error(err);
+        console.error("Fetch error:", err);
       }
     }
 
@@ -209,8 +261,9 @@
       }
     });
 
+    uploadBtn.addEventListener('click', () => fileInput.click());
+
     renderMessages();
   </script>
-
 </body>
 </html>

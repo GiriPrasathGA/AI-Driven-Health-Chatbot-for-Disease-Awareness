@@ -4,8 +4,11 @@ from typing import List, Tuple
 import requests
 from urllib.parse import quote_plus
 import re
+from PIL import Image
+import pytesseract
+from io import BytesIO
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -15,6 +18,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
+from langchain_core.documents import Document
 
 # --- Translation ---
 from deep_translator import GoogleTranslator
@@ -57,7 +61,6 @@ def translate_text(text: str, target_lang: str = "en") -> str:
     except Exception:
         return text
 
-
 # --- WHO API Fetcher ---
 def fetch_who_info(disease_name: str):
     """Fetch related info from WHO API (health topics or ICD-11)."""
@@ -79,7 +82,6 @@ def fetch_who_info(disease_name: str):
         pass
     return None
 
-
 # --- Startup: Load FAISS and Embeddings ---
 @app.on_event("startup")
 async def startup_event():
@@ -92,22 +94,19 @@ async def startup_event():
     )
     print("✅ FAISS index loaded successfully.")
 
-
 # --- Pydantic Models ---
 class ChatRequest(BaseModel):
     session_id: str
     question: str
     chat_history: List[Tuple[str, str]] = []
 
-
 class ChatResponse(BaseModel):
     answer: str
-
 
 # --- RAG Chain Setup ---
 def create_rag_chain(vectorstore):
     llm = ChatGroq(
-        temperature=0.5,  # slightly higher for more natural responses
+        temperature=0.5,
         model_name=LLM_MODEL,
         groq_api_key=os.getenv("GROQ_API_KEY")
     )
@@ -131,7 +130,6 @@ Answer:""",
         llm=llm, retriever=retriever, combine_docs_chain_kwargs={"prompt": MAIN_PROMPT}
     )
 
-
 # --- Greeting Handler ---
 def handle_greetings(user_input: str, lang: str) -> str:
     greetings = ["hi", "hello", "hey", "வணக்கம்"]
@@ -142,6 +140,64 @@ def handle_greetings(user_input: str, lang: str) -> str:
         )
     return ""
 
+# --- NEW: Image Upload Endpoint ---
+@app.post("/upload_prescription", response_model=ChatResponse)
+async def upload_prescription(
+    session_id: str = Form(...),
+    question: str = Form(""),
+    file: UploadFile = File(...)
+):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image.")
+
+    try:
+        image_bytes = await file.read()
+        image = Image.open(BytesIO(image_bytes))
+
+        # Use OCR to extract text
+        prescription_text = pytesseract.image_to_string(image)
+        
+        if not prescription_text.strip():
+            return ChatResponse(answer="I couldn't read any text from that image. Please try a clearer picture.")
+
+        llm = ChatGroq(
+            temperature=0.5,
+            model_name=LLM_MODEL,
+            groq_api_key=os.getenv("GROQ_API_KEY")
+        )
+
+        PRESCRIPTION_PROMPT = PromptTemplate(
+            template="""
+You are an AI assistant helping a user understand their medical prescription.
+Analyze the following text, which was extracted from a doctor's prescription, and provide a clear, easy-to-understand summary.
+Identify the medications, dosages, and instructions. Do NOT provide a diagnosis or treatment plan.
+Always add a disclaimer to consult a doctor.
+
+Prescription Text:
+{text}
+
+Question: {question}
+
+Summary:
+""",
+            input_variables=["text", "question"]
+        )
+
+        chain = PRESCRIPTION_PROMPT | llm
+        
+        result = chain.invoke({
+            "text": prescription_text,
+            "question": question or "Summarize the prescription."
+        })
+
+        answer = result.content.strip()
+
+        final_answer = answer + "\n\n⚕️ Please consult a healthcare professional for personalized advice."
+        
+        return ChatResponse(answer=final_answer)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
 # --- Chat Endpoint ---
 @app.post("/chat", response_model=ChatResponse)
@@ -155,15 +211,12 @@ async def chat_with_bot(request: ChatRequest):
 
     user_lang = detect_lang(input_text) or "en"
 
-    # --- Greeting check ---
     greeting_reply = handle_greetings(input_text, user_lang)
     if greeting_reply:
         return ChatResponse(answer=greeting_reply)
 
-    # --- Translate question to English ---
     translated_q = translate_text(input_text, "en")
 
-    # --- Fetch WHO information ---
     who_info = fetch_who_info(translated_q)
     external_data = ""
     if who_info:
@@ -174,20 +227,17 @@ Definition: {who_info.get('definition')}
 More Info: {who_info.get('icd_url')}
 """
 
-    # --- Create or reuse RAG session ---
     if request.session_id not in sessions:
         sessions[request.session_id] = {"rag": create_rag_chain(vector_store)}
     rag_chain = sessions[request.session_id]["rag"]
 
     try:
-        # --- RAG Chain Invocation ---
         result = rag_chain.invoke({
             "question": f"{translated_q}\n\n{external_data}",
             "chat_history": request.chat_history
         })
         answer = result.get("answer", "").strip()
 
-        # --- Remove repeated lines ---
         lines = answer.split("\n")
         unique_lines = []
         for line in lines:
@@ -195,18 +245,14 @@ More Info: {who_info.get('icd_url')}
                 unique_lines.append(line)
         answer = "\n".join(unique_lines)
 
-        # --- Clean Tamil repetitive pattern ---
         if user_lang.lower() in ["ta", "tamil"]:
             answer = re.sub(r'(நீங்கள்\s+காய்ச்சல்\s+இருக்கும்\s+போது,?\s*){2,}', r'\1', answer)
 
-        # --- Limit output length ---
         if len(answer) > 2000:
             answer = answer[:2000] + "..."
 
-        # --- Add Disclaimer ---
         answer += "\n\n⚕️ Please consult a healthcare professional for personalized advice."
 
-        # --- Translate Back ---
         final_answer = translate_text(answer, user_lang)
 
         return ChatResponse(answer=final_answer)
@@ -214,8 +260,6 @@ More Info: {who_info.get('icd_url')}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-
-# --- Run Server ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
